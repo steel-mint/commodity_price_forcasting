@@ -2,11 +2,17 @@ import os
 import torch
 import numpy as np
 import pandas as pd
-from torch.utils.data import Dataset
 from datetime import timedelta
+from torch.utils.data import Dataset
+from torch import nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 HRC_COLUMN_IDX = -1
+
 
 class HRCDataset(Dataset):
     def __init__(self, split="train", history_len_weeks=5, future_pred_weeks_len=1, total_buffer=10):
@@ -16,6 +22,8 @@ class HRCDataset(Dataset):
         self.dataset_raw = self.dataset_raw_df.values.tolist()[total_buffer:]
         self.dataset_raw_df['date'] = pd.to_datetime(self.dataset_raw_df['date'])
         self.dataset_raw_df.set_index('date', inplace=True)
+        self.dataset_raw_df.sort_index()
+        
 
         self.history_len_weeks = history_len_weeks
         self.future_pred_weeks_len = future_pred_weeks_len
@@ -25,8 +33,8 @@ class HRCDataset(Dataset):
 
         self.total_buffer = total_buffer
         # batch_idx * history_len_weeks * num_features
-        self.num_batchs = int((len(self.dataset_raw) - total_buffer)/(self.total_feature_row))
-        
+        self.num_batchs = int((len(self.dataset_raw) - total_buffer - self.total_feature_row))
+
         self.feats_normalized = []
 
         for row in self.dataset_raw:
@@ -37,18 +45,19 @@ class HRCDataset(Dataset):
             self.feats_normalized.append(self.normalize_feature(
                 row, historical_vals=hist_vals, normal_type="mean"
             ))
+
+        print(self.feats_normalized[0][1].view(1))
         
-        print(len(self.feats_normalized))
 
         self.dataset = torch.empty(
             self.num_batchs,
             self.total_feature_row,
-            self.num_features,
+            self.num_features+1,
             dtype=torch.float32,
         )
-        for i in range(0, self.num_batchs):
-            self.dataset[i] = torch.tensor(
-                [item for item in self.feats_normalized[i*self.total_feature_row : (i+1)*self.total_feature_row]]
+        for i in range(self.num_batchs):
+            self.dataset[i] = torch.stack(
+                [torch.cat([item[0], item[1].view(1)]) for item in self.feats_normalized[i : i + self.total_feature_row]]
             )
 
     def __len__(self):
@@ -56,15 +65,15 @@ class HRCDataset(Dataset):
 
     def __getitem__(self, idx):
         raw_item = self.dataset[idx]
-        feats_transposed_x = raw_item[:-1].T
-        feats_normalized_x = torch.zeros_like(feats_transposed_x)
+        feats_transposed_x = raw_item[:-1, :-1].T
 
         # hrc_price
         price_y = raw_item[-1][HRC_COLUMN_IDX]
-        return feats_normalized_x, price_y
+        price_avg = raw_item[:-1, -1].mean()
+        return feats_transposed_x, price_y, price_avg
 
     def normalize_feature(
-        self, feature_row: list, historical_vals: pd.DataFrame, normal_type="mean"
+        self, feature_row: list, historical_vals: pd.DataFrame, normal_type="mean", eps=1e-8
     ):
         if normal_type not in ["first", "mean", "last", "max"]:
             raise ValueError("Invalid Normalization Type")
@@ -81,4 +90,45 @@ class HRCDataset(Dataset):
         elif normal_type == "max":
             hist_val = torch.tensor(historical_vals.max().tolist())
         
-        return (feature_row - hist_val) / (hist_val)
+        return [(feature_row - hist_val) / (hist_val+eps), feature_row[-1]]
+
+class Predictor(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=64, nhead=4, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        self.rel_week_pos_encoding = nn.Embedding(5, 1)
+        self.feat_transform_linears = nn.ModuleList(
+            [nn.Linear(5, 64) for _ in range(11)]
+        )
+        self.out_layers = nn.ModuleList(
+            [nn.Sequential(nn.Linear(64, 1), nn.Tanh()) for _ in range(11)]
+        )
+
+    def forward(self, x):
+        B, F, W = x.shape
+
+        # F x B x W
+        x += self.rel_week_pos_encoding(torch.arange(0, W)).squeeze()
+        x = torch.stack([self.feat_transform_linears[i](x[:, i]) for i in range(F)])
+        x = self.transformer_encoder(x).reshape(B, F, 64)
+        x_out = torch.zeros(4,1)
+        for i in range(F):
+            x_out += self.out_layers[i](x[:, i])
+        return x_out
+
+predictor = Predictor()
+train_dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
+for i in train_dataloader:   
+    pred = predictor(i[0])
+    out = pred*i[2].view(4, 1)
+    true = i[1].view(4, 1)
+    loss_fn = torch.nn.MSELoss()
+    optimizers=optim.Adam(params=predictor.parameters(),lr=0.0000001)
+    optimizers.zero_grad()
+    loss = loss_fn(out, true)
+    loss.backward()
+    optimizers.step()
+    print(loss)
