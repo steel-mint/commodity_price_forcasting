@@ -1,13 +1,15 @@
 import os
-import torch
 import numpy as np
 import pandas as pd
 from datetime import timedelta
-from torch.utils.data import Dataset
-from torch import nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
 
+import torch
+from torch import nn
+import torch.nn.functional as F
+import lightning as L
+
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
 
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
@@ -92,7 +94,17 @@ class HRCDataset(Dataset):
         
         return [(feature_row - hist_val) / (hist_val+eps), feature_row[-1]]
 
-class Predictor(torch.nn.Module):
+class DataModule(L.LightningDataModule):
+    def __init__(self, dataset):
+        super().__init__()
+        self.dataset = dataset
+
+    def train_dataloader(self):
+        return DataLoader(self.dataset, batch_size=4, shuffle=True, drop_last=True)
+    
+
+
+class Predictor(L.LightningModule):
     def __init__(self):
         super().__init__()
         encoder_layer = nn.TransformerEncoderLayer(
@@ -107,7 +119,9 @@ class Predictor(torch.nn.Module):
             [nn.Sequential(nn.Linear(64, 1), nn.Tanh()) for _ in range(11)]
         )
 
-    def forward(self, x):
+    def training_step(self, batch, batch_idx):
+        # training_step defines the train loop.
+        x, y, avg_cost = batch
         B, F, W = x.shape
 
         # F x B x W
@@ -117,18 +131,19 @@ class Predictor(torch.nn.Module):
         x_out = torch.zeros(4,1)
         for i in range(F):
             x_out += self.out_layers[i](x[:, i])
-        return x_out
+        
+        out = avg_cost.view(4, 1) + x_out*avg_cost.view(4, 1)
+        true = y.view(4, 1)
+        loss = F.mse_loss(out, true)
 
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+        return optimizer
+
+dataset = HRCDataset()
+datamodule = DataModule(dataset)
 predictor = Predictor()
-train_dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
-for i in train_dataloader:   
-    pred = predictor(i[0])
-    out = pred*i[2].view(4, 1)
-    true = i[1].view(4, 1)
-    loss_fn = torch.nn.MSELoss()
-    optimizers=optim.Adam(params=predictor.parameters(),lr=0.0000001)
-    optimizers.zero_grad()
-    loss = loss_fn(out, true)
-    loss.backward()
-    optimizers.step()
-    print(loss)
+trainer = L.Trainer()
+trainer.fit(model=predictor, datamodule=datamodule)
