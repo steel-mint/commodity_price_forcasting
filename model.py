@@ -16,6 +16,7 @@ BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 HRC_COLUMN_IDX = -1
 
 
+
 class HRCDataset(Dataset):
     def __init__(self, split="train", history_len_weeks=5, future_pred_weeks_len=1, total_buffer=10):
         self.dataset_raw_df = pd.read_csv(
@@ -48,8 +49,6 @@ class HRCDataset(Dataset):
                 row, historical_vals=hist_vals, normal_type="mean"
             ))
 
-        print(self.feats_normalized[0][1].view(1))
-        
 
         self.dataset = torch.empty(
             self.num_batchs,
@@ -121,6 +120,7 @@ class Predictor(L.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # training_step defines the train loop.
+        
         x, y, avg_cost = batch
         B, F, W = x.shape
 
@@ -134,8 +134,10 @@ class Predictor(L.LightningModule):
         
         out = avg_cost.view(4, 1) + x_out*avg_cost.view(4, 1)
         true = y.view(4, 1)
-        loss = F.mse_loss(out, true)
-
+        loss = nn.functional.mse_loss(out, true)
+        
+        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        
         return loss
 
     def configure_optimizers(self):
@@ -145,5 +147,5 @@ class Predictor(L.LightningModule):
 dataset = HRCDataset()
 datamodule = DataModule(dataset)
 predictor = Predictor()
-trainer = L.Trainer()
+trainer = L.Trainer(accelerator="cpu")
 trainer.fit(model=predictor, datamodule=datamodule)
