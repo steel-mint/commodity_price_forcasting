@@ -76,10 +76,10 @@ class HRCDataset(Dataset):
         raw_item = self.dataset[idx]
         feats_transposed_x = raw_item[:-1, :-1].T
 
-        # hrc_price
-        price_y = raw_item[-1][HRC_COLUMN_IDX]
+        price_y = raw_item[-1][-2]
+        true_price = raw_item[-1][HRC_COLUMN_IDX]
         price_avg = raw_item[:-1, -1].mean()
-        return feats_transposed_x, price_y, price_avg
+        return feats_transposed_x, price_y, true_price, price_avg
 
     def normalize_feature(
         self,
@@ -133,15 +133,17 @@ class Predictor(L.LightningModule):
         return x_out
 
     def training_step(self, batch, batch_idx):
-        x, y, avg_cost = batch
+        x, y, true_price, avg_cost = batch
 
         x_out = self.forward(x)
+        y = y.view(len(y), 1)
+        loss = self.loss(x_out, y)
+
         out = avg_cost.view(len(x), 1) + x_out * avg_cost.view(len(x), 1)
-        true = y.view(len(y), 1)
-        loss = self.loss(out, true)
+        true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
-        train_acc = torch.sum(pred_percent.abs() <= 5).item() / len(y)
+        train_acc = torch.sum(pred_percent.abs() <= 5).item() / len(true)
 
         self.log_dict(
             {"train_loss": loss, "train_acc": train_acc},
@@ -154,15 +156,17 @@ class Predictor(L.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        x, y, avg_cost = batch
+        x, y, true_price, avg_cost = batch
 
         x_out = self.forward(x)
+        y = y.view(len(y), 1)
+        loss = self.loss(x_out, y)
+
         out = avg_cost.view(len(x), 1) + x_out * avg_cost.view(len(x), 1)
-        true = y.view(len(y), 1)
-        loss = self.loss(out, true)
+        true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
-        test_acc = torch.sum(pred_percent.abs() <= 5).item() / len(y)
+        test_acc = torch.sum(pred_percent.abs() <= 5).item() / len(true)
 
         self.log_dict(
             {"test_loss": loss, "test_acc": test_acc},
