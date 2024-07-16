@@ -17,17 +17,19 @@ BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 HRC_COLUMN_IDX = -1
 
 
-
 class HRCDataset(Dataset):
-    def __init__(self, split="train", history_len_weeks=5, future_pred_weeks_len=1, total_buffer=10):
-        self.dataset_raw_df = pd.read_csv(
-            os.path.join("data", f"{split}.csv")
-        )
+    def __init__(
+        self,
+        split="train",
+        history_len_weeks=5,
+        future_pred_weeks_len=1,
+        total_buffer=10,
+    ):
+        self.dataset_raw_df = pd.read_csv(os.path.join("data", f"{split}.csv"))
         self.dataset_raw = self.dataset_raw_df.values.tolist()[total_buffer:]
-        self.dataset_raw_df['date'] = pd.to_datetime(self.dataset_raw_df['date'])
-        self.dataset_raw_df.set_index('date', inplace=True)
+        self.dataset_raw_df["date"] = pd.to_datetime(self.dataset_raw_df["date"])
+        self.dataset_raw_df.set_index("date", inplace=True)
         self.dataset_raw_df.sort_index()
-        
 
         self.history_len_weeks = history_len_weeks
         self.future_pred_weeks_len = future_pred_weeks_len
@@ -41,14 +43,17 @@ class HRCDataset(Dataset):
         self.feats_normalized = []
 
         for row in self.dataset_raw:
-            start_dt = str(pd.to_datetime(row[0]) - timedelta(days=self.total_buffer*7))
+            start_dt = str(
+                pd.to_datetime(row[0]) - timedelta(days=self.total_buffer * 7)
+            )
             end_dt = str(pd.to_datetime(row[0]) - timedelta(days=1))
             hist_vals = self.dataset_raw_df.loc[start_dt:end_dt]
 
-            self.feats_normalized.append(self.normalize_feature(
-                row, historical_vals=hist_vals, normal_type="mean"
-            ))
-
+            self.feats_normalized.append(
+                self.normalize_feature(
+                    row, historical_vals=hist_vals, normal_type="mean"
+                )
+            )
 
         self.dataset = torch.empty(
             self.num_batchs,
@@ -58,7 +63,10 @@ class HRCDataset(Dataset):
         )
         for i in range(self.num_batchs):
             self.dataset[i] = torch.stack(
-                [torch.cat([item[0], item[1].view(1)]) for item in self.feats_normalized[i : i + self.total_feature_row]]
+                [
+                    torch.cat([item[0], item[1].view(1)])
+                    for item in self.feats_normalized[i : i + self.total_feature_row]
+                ]
             )
 
     def __len__(self):
@@ -74,11 +82,15 @@ class HRCDataset(Dataset):
         return feats_transposed_x, price_y, price_avg
 
     def normalize_feature(
-        self, feature_row: list, historical_vals: pd.DataFrame, normal_type="mean", eps=1e-8
+        self,
+        feature_row: list,
+        historical_vals: pd.DataFrame,
+        normal_type="mean",
+        eps=1e-8,
     ):
         if normal_type not in ["first", "mean", "last", "max"]:
             raise ValueError("Invalid Normalization Type")
-        
+
         feature_row.pop(0)
         feature_row = torch.tensor(feature_row)
 
@@ -90,8 +102,9 @@ class HRCDataset(Dataset):
             hist_val = torch.tensor(historical_vals.values.tolist()[-1])
         elif normal_type == "max":
             hist_val = torch.tensor(historical_vals.max().tolist())
-        
-        return [(feature_row - hist_val) / (hist_val+eps), feature_row[-1]]
+
+        return [(feature_row - hist_val) / (hist_val + eps), feature_row[-1]]
+
 
 class Predictor(L.LightningModule):
     def __init__(self):
@@ -114,7 +127,7 @@ class Predictor(L.LightningModule):
         x += self.rel_week_pos_encoding(torch.arange(0, W)).squeeze()
         x = torch.stack([self.feat_transform_linears[i](x[:, i]) for i in range(F)])
         x = self.transformer_encoder(x).reshape(B, F, 64)
-        x_out = torch.zeros(len(x),1)
+        x_out = torch.zeros(len(x), 1)
         for i in range(F):
             x_out += self.out_layers[i](x[:, i])
         return x_out
@@ -123,42 +136,58 @@ class Predictor(L.LightningModule):
         x, y, avg_cost = batch
 
         x_out = self.forward(x)
-        out = avg_cost.view(len(x), 1) + x_out*avg_cost.view(len(x), 1)
+        out = avg_cost.view(len(x), 1) + x_out * avg_cost.view(len(x), 1)
         true = y.view(len(y), 1)
         loss = self.loss(out, true)
 
-        pred_percent = ((out-true)/true)*100
-        train_acc = torch.sum(pred_percent.abs() <= 5).item()/len(y)
-        
-        self.log_dict({"train_loss" : loss, "train_acc" : train_acc}, on_epoch=True, prog_bar=True, logger=True)
-        
+        pred_percent = ((out - true) / true) * 100
+        train_acc = torch.sum(pred_percent.abs() <= 5).item() / len(y)
+
+        self.log_dict(
+            {"train_loss": loss, "train_acc": train_acc},
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+
         return loss
-    
+
     def test_step(self, batch, batch_idx):
         x, y, avg_cost = batch
 
         x_out = self.forward(x)
-        out = avg_cost.view(len(x), 1) + x_out*avg_cost.view(len(x), 1)
+        out = avg_cost.view(len(x), 1) + x_out * avg_cost.view(len(x), 1)
         true = y.view(len(y), 1)
         loss = self.loss(out, true)
-        
 
-        pred_percent = ((out-true)/true)*100
-        test_acc = torch.sum(pred_percent.abs() <= 5).item()/len(y)
+        pred_percent = ((out - true) / true) * 100
+        test_acc = torch.sum(pred_percent.abs() <= 5).item() / len(y)
 
-        self.log_dict({"test_loss" : loss, "test_acc" : test_acc}, on_epoch=True, prog_bar=True, logger=True)
-        
+        self.log_dict(
+            {"test_loss": loss, "test_acc": test_acc},
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
         return optimizer
 
-train_dataset = HRCDataset()
-test_dataset = HRCDataset(split='test')
-train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, drop_last=True)
-test_dataloader = DataLoader(test_dataset, batch_size=4, shuffle=True, drop_last=True)
-wandb_logger = WandbLogger(log_model="all")
-trainer = Trainer(accelerator="cpu", max_epochs=10, logger=wandb_logger)
-predictor = Predictor()
-trainer.fit(model=predictor, train_dataloaders=train_dataloader)
-trainer.test(dataloaders=test_dataloader)
+
+if __name__ == "__main__":
+    train_dataset = HRCDataset()
+    test_dataset = HRCDataset(split="test")
+    train_dataloader = DataLoader(
+        train_dataset, batch_size=4, shuffle=True, drop_last=True
+    )
+    test_dataloader = DataLoader(
+        test_dataset, batch_size=4, shuffle=True, drop_last=True
+    )
+    wandb_logger = WandbLogger(log_model="all")
+    trainer = Trainer(accelerator="cpu", max_epochs=50, logger=wandb_logger)
+    predictor = Predictor()
+    trainer.fit(model=predictor, train_dataloaders=train_dataloader)
+    trainer.test(dataloaders=test_dataloader)
