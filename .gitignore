@@ -1,3 +1,5 @@
 .DS_Store
 __pycache__/
+wandb
+lightning_logs
 test.ipynb

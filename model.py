@@ -5,15 +5,17 @@ from datetime import timedelta
 
 import torch
 from torch import nn
-import torch.nn.functional as F
 import lightning as L
 
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch import Trainer
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 HRC_COLUMN_IDX = -1
+
 
 
 class HRCDataset(Dataset):
@@ -30,12 +32,11 @@ class HRCDataset(Dataset):
         self.history_len_weeks = history_len_weeks
         self.future_pred_weeks_len = future_pred_weeks_len
         self.total_feature_row = history_len_weeks + future_pred_weeks_len
-        # remove the date column
-        self.num_features = len(self.dataset_raw[0]) - 1
+        self.num_features = len(self.dataset_raw[0])
 
         self.total_buffer = total_buffer
         # batch_idx * history_len_weeks * num_features
-        self.num_batchs = int((len(self.dataset_raw) - total_buffer - self.total_feature_row))
+        self.num_batchs = int((len(self.dataset_raw) - self.total_feature_row))
 
         self.feats_normalized = []
 
@@ -48,13 +49,11 @@ class HRCDataset(Dataset):
                 row, historical_vals=hist_vals, normal_type="mean"
             ))
 
-        print(self.feats_normalized[0][1].view(1))
-        
 
         self.dataset = torch.empty(
             self.num_batchs,
             self.total_feature_row,
-            self.num_features+1,
+            self.num_features,
             dtype=torch.float32,
         )
         for i in range(self.num_batchs):
@@ -94,16 +93,6 @@ class HRCDataset(Dataset):
         
         return [(feature_row - hist_val) / (hist_val+eps), feature_row[-1]]
 
-class DataModule(L.LightningDataModule):
-    def __init__(self, dataset):
-        super().__init__()
-        self.dataset = dataset
-
-    def train_dataloader(self):
-        return DataLoader(self.dataset, batch_size=4, shuffle=True, drop_last=True)
-    
-
-
 class Predictor(L.LightningModule):
     def __init__(self):
         super().__init__()
@@ -118,32 +107,58 @@ class Predictor(L.LightningModule):
         self.out_layers = nn.ModuleList(
             [nn.Sequential(nn.Linear(64, 1), nn.Tanh()) for _ in range(11)]
         )
+        self.loss = nn.functional.mse_loss
 
-    def training_step(self, batch, batch_idx):
-        # training_step defines the train loop.
-        x, y, avg_cost = batch
+    def forward(self, x):
         B, F, W = x.shape
-
-        # F x B x W
         x += self.rel_week_pos_encoding(torch.arange(0, W)).squeeze()
         x = torch.stack([self.feat_transform_linears[i](x[:, i]) for i in range(F)])
         x = self.transformer_encoder(x).reshape(B, F, 64)
-        x_out = torch.zeros(4,1)
+        x_out = torch.zeros(len(x),1)
         for i in range(F):
             x_out += self.out_layers[i](x[:, i])
-        
-        out = avg_cost.view(4, 1) + x_out*avg_cost.view(4, 1)
-        true = y.view(4, 1)
-        loss = F.mse_loss(out, true)
+        return x_out
 
+    def training_step(self, batch, batch_idx):
+        x, y, avg_cost = batch
+
+        x_out = self.forward(x)
+        out = avg_cost.view(len(x), 1) + x_out*avg_cost.view(len(x), 1)
+        true = y.view(len(y), 1)
+        loss = self.loss(out, true)
+
+        pred_percent = ((out-true)/true)*100
+        train_acc = torch.sum(pred_percent.abs() <= 5).item()/len(y)
+        
+        self.log_dict({"train_loss" : loss, "train_acc" : train_acc}, on_epoch=True, prog_bar=True, logger=True)
+        
         return loss
+    
+    def test_step(self, batch, batch_idx):
+        x, y, avg_cost = batch
+
+        x_out = self.forward(x)
+        out = avg_cost.view(len(x), 1) + x_out*avg_cost.view(len(x), 1)
+        true = y.view(len(y), 1)
+        loss = self.loss(out, true)
+        
+
+        pred_percent = ((out-true)/true)*100
+        test_acc = torch.sum(pred_percent.abs() <= 5).item()/len(y)
+
+        self.log_dict({"test_loss" : loss, "test_acc" : test_acc}, on_epoch=True, prog_bar=True, logger=True)
+        
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
         return optimizer
 
-dataset = HRCDataset()
-datamodule = DataModule(dataset)
+train_dataset = HRCDataset()
+test_dataset = HRCDataset(split='test')
+train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, drop_last=True)
+test_dataloader = DataLoader(test_dataset, batch_size=4, shuffle=True, drop_last=True)
+wandb_logger = WandbLogger(log_model="all")
+trainer = Trainer(accelerator="cpu", max_epochs=10, logger=wandb_logger)
 predictor = Predictor()
-trainer = L.Trainer()
-trainer.fit(model=predictor, datamodule=datamodule)
+trainer.fit(model=predictor, train_dataloaders=train_dataloader)
+trainer.test(dataloaders=test_dataloader)
