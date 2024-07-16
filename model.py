@@ -76,10 +76,10 @@ class HRCDataset(Dataset):
         raw_item = self.dataset[idx]
         feats_transposed_x = raw_item[:-1, :-1].T
 
-        price_y = raw_item[-1][-2]
+        y = raw_item[-1][-2]
         true_price = raw_item[-1][HRC_COLUMN_IDX]
-        price_avg = raw_item[:-1, -1].mean()
-        return feats_transposed_x, price_y, true_price, price_avg
+        avg_price = raw_item[:-1, -1].mean()
+        return feats_transposed_x, y, true_price, avg_price
 
     def normalize_feature(
         self,
@@ -133,13 +133,13 @@ class Predictor(L.LightningModule):
         return x_out
 
     def training_step(self, batch, batch_idx):
-        x, y, true_price, avg_cost = batch
+        x, y, true_price, avg_price = batch
 
         x_out = self.forward(x)
         y = y.view(len(y), 1)
         loss = self.loss(x_out, y)
 
-        out = avg_cost.view(len(x), 1) + x_out * avg_cost.view(len(x), 1)
+        out = avg_price.view(len(x), 1) + x_out * avg_price.view(len(x), 1)
         true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
@@ -156,13 +156,13 @@ class Predictor(L.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        x, y, true_price, avg_cost = batch
+        x, y, true_price, avg_price = batch
 
         x_out = self.forward(x)
         y = y.view(len(y), 1)
         loss = self.loss(x_out, y)
 
-        out = avg_cost.view(len(x), 1) + x_out * avg_cost.view(len(x), 1)
+        out = avg_price.view(len(x), 1) + x_out * avg_price.view(len(x), 1)
         true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
