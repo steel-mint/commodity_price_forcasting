@@ -14,6 +14,7 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch import Trainer
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+device = "cuda" if torch.cuda.is_available() else "cpu"
 HRC_COLUMN_IDX = -1
 
 
@@ -124,16 +125,22 @@ class Predictor(L.LightningModule):
 
     def forward(self, x):
         B, F, W = x.shape
-        x += self.rel_week_pos_encoding(torch.arange(0, W)).squeeze()
+        x += self.rel_week_pos_encoding(torch.arange(0, W).to(self.device)).squeeze()
         x = torch.stack([self.feat_transform_linears[i](x[:, i]) for i in range(F)])
         x = self.transformer_encoder(x).reshape(B, F, 64)
-        x_out = torch.zeros(len(x), 1)
+        x_out = torch.zeros(len(x), 1).to(self.device)
         for i in range(F):
             x_out += self.out_layers[i](x[:, i])
         return x_out
 
     def training_step(self, batch, batch_idx):
         x, y, true_price, avg_price = batch
+        x, y, true_price, avg_price = (
+            x.to(self.device),
+            y.to(self.device),
+            true_price.to(self.device),
+            avg_price.to(self.device),
+        )
 
         x_out = self.forward(x)
         y = y.view(len(y), 1)
@@ -157,6 +164,12 @@ class Predictor(L.LightningModule):
 
     def test_step(self, batch, batch_idx):
         x, y, true_price, avg_price = batch
+        x, y, true_price, avg_price = (
+            x.to(self.device),
+            y.to(self.device),
+            true_price.to(self.device),
+            avg_price.to(self.device),
+        )
 
         x_out = self.forward(x)
         y = y.view(len(y), 1)
@@ -191,7 +204,7 @@ if __name__ == "__main__":
         test_dataset, batch_size=4, shuffle=True, drop_last=True
     )
     wandb_logger = WandbLogger(log_model="all")
-    trainer = Trainer(accelerator="cpu", max_epochs=50, logger=wandb_logger)
+    trainer = Trainer(accelerator=device, max_epochs=50, logger=wandb_logger)
     predictor = Predictor()
     trainer.fit(model=predictor, train_dataloaders=train_dataloader)
     trainer.test(dataloaders=test_dataloader)
