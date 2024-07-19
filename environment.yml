@@ -5,7 +5,9 @@ channels:
   - defaults
 dependencies:
   - python==3.10
-  - lightning==2.3.3
+  - ipykernel
   - pip
   - pip:
+    - lightning==2.3.3
     - wandb==0.17.4
+    - pandas==2.2.2
