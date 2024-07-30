@@ -15,7 +15,6 @@ from lightning.pytorch import Trainer
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 device = "cuda" if torch.cuda.is_available() else "cpu"
-HRC_COLUMN_IDX = -1
 
 data_config = {
     "split": "train",
@@ -35,6 +34,9 @@ predictor_config = {
     "num_features": 18,
     "upscale_deminsion": 64,
     "loss_fn": nn.functional.mse_loss,
+    "delta_p_wt": 1,
+    "ps_wt": 1,
+    "as_wt": 0.1,
     "threshold": 1.5,
     "optimizer": torch.optim.Adam,
     "lr": 1e-3,
@@ -102,8 +104,8 @@ class HRCDataset(Dataset):
         raw_item = self.dataset[idx]
         feats_transposed_x = raw_item[:-1, :-1].T
 
-        y = raw_item[-1][-2]
-        true_price = raw_item[-1][HRC_COLUMN_IDX]
+        y = raw_item[-1][:-1]
+        true_price = raw_item[-1][-1]
         last_price = raw_item[-2][-1]
         return feats_transposed_x, y, true_price, last_price
 
@@ -133,9 +135,9 @@ class HRCDataset(Dataset):
 
 
 class Predictor(L.LightningModule):
-
     def __init__(self, predictor_config):
         super().__init__()
+
         self.encoder_d = predictor_config["encoder_d"]
         self.encoder_nheads = predictor_config["encoder_nheads"]
         self.transformer_num_layers = predictor_config["transformer_num_layers"]
@@ -143,12 +145,17 @@ class Predictor(L.LightningModule):
         self.num_features = predictor_config["num_features"]
         self.upscale_deminsion = predictor_config["upscale_deminsion"]
         self.loss = predictor_config["loss_fn"]
+        self.delta_p_wt = predictor_config["delta_p_wt"]
+        self.ps_wt = predictor_config["ps_wt"]
+        self.as_wt = predictor_config["as_wt"]
         self.threshold = predictor_config["threshold"]
         self.optimizer = predictor_config["optimizer"]
         self.lr = predictor_config["lr"]
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.encoder_d, nhead=self.encoder_nheads, batch_first=True
+            d_model=self.encoder_d,
+            nhead=self.encoder_nheads,
+            batch_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=self.transformer_num_layers
@@ -156,14 +163,17 @@ class Predictor(L.LightningModule):
         self.rel_week_pos_encoding = nn.Embedding(self.context_len_week, 1)
         self.feat_transform_linears = nn.ModuleList(
             [
-                nn.Linear(self.context_len_week, self.upscale_deminsion)
+                nn.Linear(
+                    self.context_len_week,
+                    self.upscale_deminsion,
+                )
                 for _ in range(self.num_features)
             ]
         )
         self.out_layers = nn.ModuleList(
             [
-                nn.Sequential(nn.Linear(self.upscale_deminsion, 1), nn.Tanh())
-                for _ in range(self.num_features)
+                nn.Sequential(nn.Linear(self.upscale_deminsion, 2), nn.Tanh())
+                for _ in range(self.upscale_deminsion)
             ]
         )
 
@@ -172,25 +182,41 @@ class Predictor(L.LightningModule):
         x += self.rel_week_pos_encoding(torch.arange(0, W).to(self.device)).squeeze()
         x = torch.stack([self.feat_transform_linears[i](x[:, i]) for i in range(F)])
         x = self.transformer_encoder(x).reshape(B, F, self.upscale_deminsion)
-        x_out = torch.zeros(len(x), 1).to(self.device)
-        for i in range(F):
-            x_out += self.out_layers[i](x[:, i])
+        x_out = torch.stack([self.out_layers[i](x[:, i]) for i in range(F)])
         return x_out
 
     def training_step(self, batch, batch_idx):
-        x, y, true_price, avg_price = batch
-        x, y, true_price, avg_price = (
+        x, y, true_price, last_price = batch
+        x, y, true_price, last_price = (
             x.to(self.device),
             y.to(self.device),
             true_price.to(self.device),
-            avg_price.to(self.device),
+            last_price.to(self.device),
         )
 
         x_out = self.forward(x)
-        y = y.view(len(y), 1)
-        loss = self.loss(x_out, y)
+        x_as = x_out[:, :, 0]
+        x_ps = x_out[:, :, 1]
+        delta_p = (x_as * x_ps).sum(0)
+        true_p = y[:, -1]
+        true_ps = y.T
+        # Loss 1
+        loss_delta_p = self.loss(delta_p, true_p)
+        # Loss 2
+        loss_ps = self.loss(x_ps, true_ps)
+        # Loss 3
+        a_sq = (x_as**2).sum(0)
+        a_zero = torch.zeros(len(a_sq)).to(self.device)
+        loss_as = self.loss(a_sq, a_zero)
 
-        out = avg_price.view(len(x), 1) + x_out * avg_price.view(len(x), 1)
+        # Final Loss
+        loss = (
+            self.delta_p_wt * loss_delta_p + self.ps_wt * loss_ps + self.as_wt * loss_as
+        )
+
+        out = last_price.view(len(x), 1) + delta_p.view(len(x), 1) * last_price.view(
+            len(x), 1
+        )
         true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
@@ -207,19 +233,37 @@ class Predictor(L.LightningModule):
         return loss
 
     def test_step(self, batch, batch_idx):
-        x, y, true_price, avg_price = batch
-        x, y, true_price, avg_price = (
+        x, y, true_price, last_price = batch
+        x, y, true_price, last_price = (
             x.to(self.device),
             y.to(self.device),
             true_price.to(self.device),
-            avg_price.to(self.device),
+            last_price.to(self.device),
         )
 
         x_out = self.forward(x)
-        y = y.view(len(y), 1)
-        loss = self.loss(x_out, y)
+        x_as = x_out[:, :, 0]
+        x_ps = x_out[:, :, 1]
+        delta_p = (x_as * x_ps).sum(0)
+        true_p = y[:, -1]
+        true_ps = y.T
+        # Loss 1
+        loss_delta_p = self.loss(delta_p, true_p)
+        # Loss 2
+        loss_ps = self.loss(x_ps, true_ps)
+        # Loss 3
+        a_sq = (x_as**2).sum(0)
+        a_zero = torch.zeros(len(a_sq)).to(self.device)
+        loss_as = self.loss(a_sq, a_zero)
 
-        out = avg_price.view(len(x), 1) + x_out * avg_price.view(len(x), 1)
+        # Final Loss
+        loss = (
+            self.delta_p_wt * loss_delta_p + self.ps_wt * loss_ps + self.as_wt * loss_as
+        )
+
+        out = last_price.view(len(x), 1) + delta_p.view(len(x), 1) * last_price.view(
+            len(x), 1
+        )
         true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
@@ -252,7 +296,7 @@ if __name__ == "__main__":
         test_dataset, batch_size=data_config["batch_size"], shuffle=True, drop_last=True
     )
     wandb_logger = WandbLogger(log_model="all")
-    trainer = Trainer(accelerator=device, max_epochs=10, logger=wandb_logger)
+    trainer = Trainer(accelerator=device, max_epochs=100, logger=wandb_logger)
     predictor = Predictor(predictor_config=predictor_config)
     trainer.fit(model=predictor, train_dataloaders=train_dataloader)
     trainer.test(dataloaders=test_dataloader)
