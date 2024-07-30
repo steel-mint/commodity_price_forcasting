@@ -10,34 +10,56 @@ import lightning as L
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch import Trainer
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 device = "cuda" if torch.cuda.is_available() else "cpu"
 HRC_COLUMN_IDX = -1
 
+data_config = {
+    "split": "train",
+    "history_len_weeks": 5,
+    "future_pred_weeks_len": 1,
+    "total_buffer": 10,
+    "normal_type": "mean",
+    "eps": 1e-8,
+    "batch_size": 4,
+}
+
+predictor_config = {
+    "encoder_d": 64,
+    "encoder_nheads": 4,
+    "transformer_num_layers": 4,
+    "context_len_week": 5,
+    "num_features": 18,
+    "upscale_deminsion": 64,
+    "loss_fn": nn.functional.mse_loss,
+    "threshold": 1.5,
+    "optimizer": torch.optim.Adam,
+    "lr": 1e-3,
+}
+
 
 class HRCDataset(Dataset):
-    def __init__(
-        self,
-        split="train",
-        history_len_weeks=5,
-        future_pred_weeks_len=1,
-        total_buffer=10,
-    ):
-        self.dataset_raw_df = pd.read_csv(os.path.join("data", f"{split}.csv"))
-        self.dataset_raw = self.dataset_raw_df.values.tolist()[total_buffer:]
+
+    def __init__(self, data_config):
+        self.dataset_raw_df = pd.read_csv(
+            os.path.join("data", f"{data_config['split']}.csv")
+        )
+        self.dataset_raw = self.dataset_raw_df.values.tolist()[
+            data_config["total_buffer"] :
+        ]
         self.dataset_raw_df["date"] = pd.to_datetime(self.dataset_raw_df["date"])
         self.dataset_raw_df.set_index("date", inplace=True)
         self.dataset_raw_df.sort_index()
 
-        self.history_len_weeks = history_len_weeks
-        self.future_pred_weeks_len = future_pred_weeks_len
-        self.total_feature_row = history_len_weeks + future_pred_weeks_len
+        self.history_len_weeks = data_config["history_len_weeks"]
+        self.future_pred_weeks_len = data_config["future_pred_weeks_len"]
+        self.total_feature_row = self.history_len_weeks + self.future_pred_weeks_len
         self.num_features = len(self.dataset_raw[0])
 
-        self.total_buffer = total_buffer
+        self.total_buffer = data_config["total_buffer"]
         # batch_idx * history_len_weeks * num_features
         self.num_batchs = int((len(self.dataset_raw) - self.total_feature_row))
 
@@ -52,7 +74,10 @@ class HRCDataset(Dataset):
 
             self.feats_normalized.append(
                 self.normalize_feature(
-                    row, historical_vals=hist_vals, normal_type="mean"
+                    row,
+                    historical_vals=hist_vals,
+                    normal_type=data_config["normal_type"],
+                    eps=data_config["eps"],
                 )
             )
 
@@ -79,15 +104,15 @@ class HRCDataset(Dataset):
 
         y = raw_item[-1][-2]
         true_price = raw_item[-1][HRC_COLUMN_IDX]
-        avg_price = raw_item[:-1, -1].mean()
-        return feats_transposed_x, y, true_price, avg_price
+        last_price = raw_item[-2][-1]
+        return feats_transposed_x, y, true_price, last_price
 
     def normalize_feature(
         self,
-        feature_row: list,
-        historical_vals: pd.DataFrame,
-        normal_type="mean",
-        eps=1e-8,
+        feature_row,
+        historical_vals,
+        normal_type,
+        eps,
     ):
         if normal_type not in ["first", "mean", "last", "max"]:
             raise ValueError("Invalid Normalization Type")
@@ -108,26 +133,45 @@ class HRCDataset(Dataset):
 
 
 class Predictor(L.LightningModule):
-    def __init__(self):
+
+    def __init__(self, predictor_config):
         super().__init__()
+        self.encoder_d = predictor_config["encoder_d"]
+        self.encoder_nheads = predictor_config["encoder_nheads"]
+        self.transformer_num_layers = predictor_config["transformer_num_layers"]
+        self.context_len_week = predictor_config["context_len_week"]
+        self.num_features = predictor_config["num_features"]
+        self.upscale_deminsion = predictor_config["upscale_deminsion"]
+        self.loss = predictor_config["loss_fn"]
+        self.threshold = predictor_config["threshold"]
+        self.optimizer = predictor_config["optimizer"]
+        self.lr = predictor_config["lr"]
+
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=64, nhead=4, batch_first=True
+            d_model=self.encoder_d, nhead=self.encoder_nheads, batch_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
-        self.rel_week_pos_encoding = nn.Embedding(5, 1)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=self.transformer_num_layers
+        )
+        self.rel_week_pos_encoding = nn.Embedding(self.context_len_week, 1)
         self.feat_transform_linears = nn.ModuleList(
-            [nn.Linear(5, 64) for _ in range(11)]
+            [
+                nn.Linear(self.context_len_week, self.upscale_deminsion)
+                for _ in range(self.num_features)
+            ]
         )
         self.out_layers = nn.ModuleList(
-            [nn.Sequential(nn.Linear(64, 1), nn.Tanh()) for _ in range(11)]
+            [
+                nn.Sequential(nn.Linear(self.upscale_deminsion, 1), nn.Tanh())
+                for _ in range(self.num_features)
+            ]
         )
-        self.loss = nn.functional.mse_loss
 
     def forward(self, x):
         B, F, W = x.shape
         x += self.rel_week_pos_encoding(torch.arange(0, W).to(self.device)).squeeze()
         x = torch.stack([self.feat_transform_linears[i](x[:, i]) for i in range(F)])
-        x = self.transformer_encoder(x).reshape(B, F, 64)
+        x = self.transformer_encoder(x).reshape(B, F, self.upscale_deminsion)
         x_out = torch.zeros(len(x), 1).to(self.device)
         for i in range(F):
             x_out += self.out_layers[i](x[:, i])
@@ -150,7 +194,7 @@ class Predictor(L.LightningModule):
         true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
-        train_acc = torch.sum(pred_percent.abs() <= 5).item() / len(true)
+        train_acc = torch.sum(pred_percent.abs() <= self.threshold).item() / len(true)
 
         self.log_dict(
             {"train_loss": loss, "train_acc": train_acc},
@@ -179,7 +223,7 @@ class Predictor(L.LightningModule):
         true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
-        test_acc = torch.sum(pred_percent.abs() <= 5).item() / len(true)
+        test_acc = torch.sum(pred_percent.abs() <= self.threshold).item() / len(true)
 
         self.log_dict(
             {"test_loss": loss, "test_acc": test_acc},
@@ -190,21 +234,25 @@ class Predictor(L.LightningModule):
         )
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-        return optimizer
+        return self.optimizer(self.parameters(), lr=self.lr)
 
 
 if __name__ == "__main__":
-    train_dataset = HRCDataset()
-    test_dataset = HRCDataset(split="test")
+    train_dataset = HRCDataset(data_config)
+    test_data_config = data_config.copy()
+    test_data_config["split"] = "test"
+    test_dataset = HRCDataset(test_data_config)
     train_dataloader = DataLoader(
-        train_dataset, batch_size=4, shuffle=True, drop_last=True
+        train_dataset,
+        batch_size=data_config["batch_size"],
+        shuffle=True,
+        drop_last=True,
     )
     test_dataloader = DataLoader(
-        test_dataset, batch_size=4, shuffle=True, drop_last=True
+        test_dataset, batch_size=data_config["batch_size"], shuffle=True, drop_last=True
     )
     wandb_logger = WandbLogger(log_model="all")
-    trainer = Trainer(accelerator=device, max_epochs=50, logger=wandb_logger)
-    predictor = Predictor()
+    trainer = Trainer(accelerator=device, max_epochs=10, logger=wandb_logger)
+    predictor = Predictor(predictor_config=predictor_config)
     trainer.fit(model=predictor, train_dataloaders=train_dataloader)
     trainer.test(dataloaders=test_dataloader)
