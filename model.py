@@ -7,8 +7,8 @@ import torch
 from torch import nn
 import lightning as L
 
-from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
+from sklearn.model_selection import train_test_split
 
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch import Trainer
@@ -26,6 +26,7 @@ data_config = {
     "normal_type": "mean",
     "eps": 1e-8,
     "batch_size": 4,
+    "split_size": 0.2,
 }
 
 predictor_config = {
@@ -133,6 +134,48 @@ class HRCDataset(Dataset):
         return [(feature_row - hist_val) / (hist_val + eps), feature_row[-1]]
 
 
+class DataModule(L.LightningDataModule):
+
+    def __init__(self, data_config):
+        super().__init__()
+        self.dataset = HRCDataset(data_config)
+
+    def setup(self, stage: str):
+        if stage == "fit":
+            self.train, self.val = train_test_split(
+                self.dataset, test_size=data_config["split_size"], shuffle=True
+            )
+
+        if stage == "test":
+            test_data_config = data_config.copy()
+            test_data_config["split"] = "test"
+            self.test_dataset = HRCDataset(test_data_config)
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train,
+            batch_size=data_config["batch_size"],
+            shuffle=True,
+            drop_last=True,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val,
+            batch_size=data_config["batch_size"],
+            shuffle=True,
+            drop_last=True,
+        )
+
+    def test_dataloader(self):
+        return DataLoader(
+            self.test_dataset,
+            batch_size=data_config["batch_size"],
+            shuffle=True,
+            drop_last=True,
+        )
+
+
 class Predictor(L.LightningModule):
     def __init__(self, predictor_config):
         super().__init__()
@@ -230,6 +273,53 @@ class Predictor(L.LightningModule):
 
         return loss
 
+    def validation_step(self, batch, batch_idx):
+        x, y, true_price, last_price = batch
+        x, y, true_price, last_price = (
+            x.to(self.device),
+            y.to(self.device),
+            true_price.to(self.device),
+            last_price.to(self.device),
+        )
+
+        x_out = self.forward(x)
+        x_as = x_out[:, :, 0]
+        x_ps = x_out[:, :, 1]
+        delta_p = (x_as * x_ps).sum(0)
+        true_p = y[:, -1]
+        true_ps = y.T
+        # Loss 1
+        loss_delta_p = self.loss(delta_p, true_p)
+        # Loss 2
+        loss_ps = self.loss(x_ps, true_ps)
+        # Loss 3
+        a_sq = (x_as**2).sum(0)
+        a_zero = torch.zeros(len(a_sq)).to(self.device)
+        loss_as = self.loss(a_sq, a_zero)
+
+        # Final Loss
+        loss = (
+            self.delta_p_wt * loss_delta_p + self.ps_wt * loss_ps + self.as_wt * loss_as
+        )
+
+        out = last_price.view(len(x), 1) + delta_p.view(len(x), 1) * last_price.view(
+            len(x), 1
+        )
+        true = true_price.view(len(true_price), 1)
+
+        pred_percent = ((out - true) / true) * 100
+        val_acc = torch.sum(pred_percent.abs() <= self.threshold).item() / len(true)
+
+        self.log_dict(
+            {"val_loss": loss, "val_acc": val_acc},
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+
+        return loss
+
     def test_step(self, batch, batch_idx):
         x, y, true_price, last_price = batch
         x, y, true_price, last_price = (
@@ -287,25 +377,13 @@ class Predictor(L.LightningModule):
                     patience=5,
                     factor=0.05,
                 ),
-                "monitor": "train_acc",
+                "monitor": "val_acc",
             },
         }
 
 
 if __name__ == "__main__":
-    train_dataset = HRCDataset(data_config)
-    test_data_config = data_config.copy()
-    test_data_config["split"] = "test"
-    test_dataset = HRCDataset(test_data_config)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=data_config["batch_size"],
-        shuffle=True,
-        drop_last=True,
-    )
-    test_dataloader = DataLoader(
-        test_dataset, batch_size=data_config["batch_size"], shuffle=True, drop_last=True
-    )
+    datamodule = DataModule(data_config=data_config)
     wandb_logger = WandbLogger(log_model="all")
     trainer = Trainer(
         accelerator=device,
@@ -316,5 +394,5 @@ if __name__ == "__main__":
         ],
     )
     predictor = Predictor(predictor_config=predictor_config)
-    trainer.fit(model=predictor, train_dataloaders=train_dataloader)
-    trainer.test(ckpt_path="best", dataloaders=test_dataloader)
+    trainer.fit(model=predictor, datamodule=datamodule)
+    trainer.test(ckpt_path="best", datamodule=datamodule)
