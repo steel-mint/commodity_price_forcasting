@@ -35,12 +35,10 @@ predictor_config = {
     "context_len_week": 5,
     "num_features": 18,
     "upscale_deminsion": 64,
-    "loss_fn": nn.functional.mse_loss,
     "delta_p_wt": 1,
     "ps_wt": 1,
     "as_wt": 0.1,
     "threshold": 1.5,
-    "optimizer": torch.optim.Adam,
     "lr": 1e-2,
 }
 
@@ -146,14 +144,14 @@ class Predictor(L.LightningModule):
         self.context_len_week = predictor_config["context_len_week"]
         self.num_features = predictor_config["num_features"]
         self.upscale_deminsion = predictor_config["upscale_deminsion"]
-        self.loss = predictor_config["loss_fn"]
         self.delta_p_wt = predictor_config["delta_p_wt"]
         self.ps_wt = predictor_config["ps_wt"]
         self.as_wt = predictor_config["as_wt"]
         self.threshold = predictor_config["threshold"]
-        self.optimizer = predictor_config["optimizer"]
         self.lr = predictor_config["lr"]
 
+        self.loss = nn.functional.mse_loss
+        self.optimizer = torch.optim.Adam
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.encoder_d,
             nhead=self.encoder_nheads,
@@ -175,7 +173,7 @@ class Predictor(L.LightningModule):
         self.out_layers = nn.ModuleList(
             [
                 nn.Sequential(nn.Linear(self.upscale_deminsion, 2), nn.Tanh())
-                for _ in range(self.upscale_deminsion)
+                for _ in range(self.num_features)
             ]
         )
 
