@@ -199,7 +199,9 @@ class Predictor(L.LightningModule):
             batch_first=True,
         )
         self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers=self.transformer_num_layers
+            encoder_layer,
+            num_layers=self.transformer_num_layers,
+            norm=nn.LayerNorm(self.encoder_d),
         )
         self.rel_week_pos_encoding = nn.Embedding(self.context_len_week, 1)
         self.feat_transform_linears = nn.ModuleList(
@@ -226,15 +228,7 @@ class Predictor(L.LightningModule):
         x_out = torch.stack([self.out_layers[i](x[:, i]) for i in range(F)])
         return x_out
 
-    def training_step(self, batch, batch_idx):
-        x, y, true_price, last_price = batch
-        x, y, true_price, last_price = (
-            x.to(self.device),
-            y.to(self.device),
-            true_price.to(self.device),
-            last_price.to(self.device),
-        )
-
+    def loss_n_acc_func(self, x, y, true_price, last_price):
         x_out = self.forward(x)
         x_as = x_out[:, :, 0]
         x_ps = x_out[:, :, 1]
@@ -254,14 +248,28 @@ class Predictor(L.LightningModule):
         loss = (
             self.delta_p_wt * loss_delta_p + self.ps_wt * loss_ps + self.as_wt * loss_as
         )
-
         out = last_price.view(len(x), 1) + delta_p.view(len(x), 1) * last_price.view(
             len(x), 1
         )
         true = true_price.view(len(true_price), 1)
 
         pred_percent = ((out - true) / true) * 100
-        train_acc = torch.sum(pred_percent.abs() <= self.threshold).item() / len(true)
+        accuracy = torch.sum(pred_percent.abs() <= self.threshold).item() / len(true)
+
+        return loss, loss_delta_p, loss_ps, loss_as, accuracy
+
+    def training_step(self, batch, batch_idx):
+        x, y, true_price, last_price = batch
+        x, y, true_price, last_price = (
+            x.to(self.device),
+            y.to(self.device),
+            true_price.to(self.device),
+            last_price.to(self.device),
+        )
+
+        loss, loss_delta_p, loss_ps, loss_as, train_acc = self.loss_n_acc_func(
+            x=x, y=y, true_price=true_price, last_price=last_price
+        )
 
         self.log_dict(
             {"train_loss": loss, "train_acc": train_acc},
@@ -282,34 +290,9 @@ class Predictor(L.LightningModule):
             last_price.to(self.device),
         )
 
-        x_out = self.forward(x)
-        x_as = x_out[:, :, 0]
-        x_ps = x_out[:, :, 1]
-        delta_p = (x_as * x_ps).sum(0)
-        true_p = y[:, -1]
-        true_ps = y.T
-        # Loss 1
-        loss_delta_p = self.loss(delta_p, true_p)
-        # Loss 2
-        loss_ps = self.loss(x_ps, true_ps)
-        # Loss 3
-        a_sq = (x_as**2).sum(0)
-        a_zero = torch.zeros(len(a_sq)).to(self.device)
-        loss_as = self.loss(a_sq, a_zero)
-
-        # Final Loss
-        loss = (
-            self.delta_p_wt * loss_delta_p + self.ps_wt * loss_ps + self.as_wt * loss_as
+        loss, loss_delta_p, loss_ps, loss_as, val_acc = self.loss_n_acc_func(
+            x=x, y=y, true_price=true_price, last_price=last_price
         )
-
-        out = last_price.view(len(x), 1) + delta_p.view(len(x), 1) * last_price.view(
-            len(x), 1
-        )
-        true = true_price.view(len(true_price), 1)
-
-        pred_percent = ((out - true) / true) * 100
-        val_acc = torch.sum(pred_percent.abs() <= self.threshold).item() / len(true)
-
         self.log_dict(
             {"val_loss": loss, "val_acc": val_acc},
             on_step=True,
@@ -329,34 +312,9 @@ class Predictor(L.LightningModule):
             last_price.to(self.device),
         )
 
-        x_out = self.forward(x)
-        x_as = x_out[:, :, 0]
-        x_ps = x_out[:, :, 1]
-        delta_p = (x_as * x_ps).sum(0)
-        true_p = y[:, -1]
-        true_ps = y.T
-        # Loss 1
-        loss_delta_p = self.loss(delta_p, true_p)
-        # Loss 2
-        loss_ps = self.loss(x_ps, true_ps)
-        # Loss 3
-        a_sq = (x_as**2).sum(0)
-        a_zero = torch.zeros(len(a_sq)).to(self.device)
-        loss_as = self.loss(a_sq, a_zero)
-
-        # Final Loss
-        loss = (
-            self.delta_p_wt * loss_delta_p + self.ps_wt * loss_ps + self.as_wt * loss_as
+        loss, loss_delta_p, loss_ps, loss_as, test_acc = self.loss_n_acc_func(
+            x=x, y=y, true_price=true_price, last_price=last_price
         )
-
-        out = last_price.view(len(x), 1) + delta_p.view(len(x), 1) * last_price.view(
-            len(x), 1
-        )
-        true = true_price.view(len(true_price), 1)
-
-        pred_percent = ((out - true) / true) * 100
-        test_acc = torch.sum(pred_percent.abs() <= self.threshold).item() / len(true)
-
         self.log_dict(
             {"test_loss": loss, "test_acc": test_acc},
             on_step=True,
@@ -372,12 +330,12 @@ class Predictor(L.LightningModule):
             "lr_scheduler": {
                 "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer,
-                    mode="max",
+                    mode="min",
                     verbose=True,
                     patience=5,
                     factor=0.05,
                 ),
-                "monitor": "val_acc",
+                "monitor": "val_loss",
             },
         }
 
@@ -390,7 +348,7 @@ if __name__ == "__main__":
         max_epochs=1000,
         logger=wandb_logger,
         callbacks=[
-            EarlyStopping(monitor="train_acc", mode="max", patience=50, verbose=True)
+            EarlyStopping(monitor="val_loss", mode="min", patience=50, verbose=True)
         ],
     )
     predictor = Predictor(predictor_config=predictor_config)
