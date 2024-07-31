@@ -12,6 +12,8 @@ from torch.utils.data import Dataset
 
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch import Trainer
+from lightning.pytorch.callbacks.early_stopping import EarlyStopping
+
 
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -39,7 +41,7 @@ predictor_config = {
     "as_wt": 0.1,
     "threshold": 1.5,
     "optimizer": torch.optim.Adam,
-    "lr": 1e-3,
+    "lr": 1e-2,
 }
 
 
@@ -278,7 +280,20 @@ class Predictor(L.LightningModule):
         )
 
     def configure_optimizers(self):
-        return self.optimizer(self.parameters(), lr=self.lr)
+        optimizer = self.optimizer(self.parameters(), lr=self.lr)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode="max",
+                    verbose=True,
+                    patience=5,
+                    factor=0.05,
+                ),
+                "monitor": "train_acc",
+            },
+        }
 
 
 if __name__ == "__main__":
@@ -296,7 +311,14 @@ if __name__ == "__main__":
         test_dataset, batch_size=data_config["batch_size"], shuffle=True, drop_last=True
     )
     wandb_logger = WandbLogger(log_model="all")
-    trainer = Trainer(accelerator=device, max_epochs=100, logger=wandb_logger)
+    trainer = Trainer(
+        accelerator=device,
+        max_epochs=1000,
+        logger=wandb_logger,
+        callbacks=[
+            EarlyStopping(monitor="train_acc", mode="max", patience=50, verbose=True)
+        ],
+    )
     predictor = Predictor(predictor_config=predictor_config)
     trainer.fit(model=predictor, train_dataloaders=train_dataloader)
-    trainer.test(dataloaders=test_dataloader)
+    trainer.test(ckpt_path="best", dataloaders=test_dataloader)
