@@ -34,7 +34,6 @@ predictor_config = {
     "transformer_num_layers": 4,
     "context_len_week": 5,
     "num_features": 18,
-    "upscale_deminsion": 64,
     "delta_p_wt": 1,
     "ps_wt": 1,
     "as_wt": 0.1,
@@ -143,7 +142,6 @@ class Predictor(L.LightningModule):
         self.transformer_num_layers = predictor_config["transformer_num_layers"]
         self.context_len_week = predictor_config["context_len_week"]
         self.num_features = predictor_config["num_features"]
-        self.upscale_deminsion = predictor_config["upscale_deminsion"]
         self.delta_p_wt = predictor_config["delta_p_wt"]
         self.ps_wt = predictor_config["ps_wt"]
         self.as_wt = predictor_config["as_wt"]
@@ -165,14 +163,14 @@ class Predictor(L.LightningModule):
             [
                 nn.Linear(
                     self.context_len_week,
-                    self.upscale_deminsion,
+                    self.encoder_d,
                 )
                 for _ in range(self.num_features)
             ]
         )
         self.out_layers = nn.ModuleList(
             [
-                nn.Sequential(nn.Linear(self.upscale_deminsion, 2), nn.Tanh())
+                nn.Sequential(nn.Linear(self.encoder_d, 2), nn.Tanh())
                 for _ in range(self.num_features)
             ]
         )
@@ -181,7 +179,7 @@ class Predictor(L.LightningModule):
         B, F, W = x.shape
         x += self.rel_week_pos_encoding(torch.arange(0, W).to(self.device)).squeeze()
         x = torch.stack([self.feat_transform_linears[i](x[:, i]) for i in range(F)])
-        x = self.transformer_encoder(x).reshape(B, F, self.upscale_deminsion)
+        x = self.transformer_encoder(x).reshape(B, F, self.encoder_d)
         x_out = torch.stack([self.out_layers[i](x[:, i]) for i in range(F)])
         return x_out
 
