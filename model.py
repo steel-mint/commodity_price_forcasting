@@ -38,7 +38,7 @@ predictor_config = {
     "delta_p_wt": 1,
     "ps_wt": 1,
     "as_wt": 0.1,
-    "threshold": 1.5,
+    "threshold": 0.5,
     "lr": 1e-2,
 }
 
