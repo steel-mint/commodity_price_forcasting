@@ -10,10 +10,10 @@ sweep_config["parameters"] = {
     "lr": {"values": [1e-1, 1e-2, 1e-3]},
     "context_len_week": {"value": 5},
     "num_features": {"value": 18},
-    "threshold": {"value": 0.5},
-    "delta_p_wt": {"value": 0.5},
-    "ps_wt": {"value": 0.4},
-    "as_wt": {"value": 0.1},
+    "threshold": {"value": 1.0},
+    "delta_p_wt": {"value": 5},
+    "ps_wt": {"value": 4},
+    "as_wt": {"value": 1},
 }
 
 sweep_id = wandb.sweep(sweep_config, project="steelmint_forcasting")
@@ -26,6 +26,7 @@ def sweep_train(config=None):
         wandb_logger = WandbLogger(log_model="all")
         trainer = Trainer(
             accelerator=device,
+            devices=1,
             max_epochs=1000,
             logger=wandb_logger,
             callbacks=[
@@ -37,4 +38,4 @@ def sweep_train(config=None):
         trainer.test(ckpt_path="best", datamodule=datamodule)
 
 
-wandb.agent(sweep_id, sweep_train, count=5000)
+wandb.agent(sweep_id, sweep_train, count=500)

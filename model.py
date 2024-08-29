@@ -18,7 +18,7 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-data_config = {
+config = {
     "split": "train",
     "history_len_weeks": 5,
     "future_pred_weeks_len": 1,
@@ -29,14 +29,10 @@ data_config = {
     "val_batch_size": 4,
     "test_batch_size": 4,
     "split_size": 0.2,
-}
-
-predictor_config = {
     "encoder_d": 64,
     "encoder_nheads": 4,
     "transformer_num_layers": 4,
     "transformer_dim_feedfoward": 128,
-    "context_len_week": 5,
     "num_features": 18,
     "delta_p_wt": 5,
     "ps_wt": 4,
@@ -48,10 +44,10 @@ predictor_config = {
 
 class HRCDataset(Dataset):
 
-    def __init__(self, data_config):
+    def __init__(self, config):
 
-        self.total_buffer = data_config["total_buffer"]
-        self.split = data_config["split"]
+        self.total_buffer = config["total_buffer"]
+        self.split = config["split"]
         if self.split == "predict":
             self.dataset_raw_df = pd.concat(
                 [
@@ -67,8 +63,8 @@ class HRCDataset(Dataset):
 
             self.dataset_raw = self.dataset_raw_df[
                 self.dataset_raw_df.index
-                < (pd.to_datetime(data_config["pred_date"]) - timedelta(days=1))
-            ].tail(15)
+                < (pd.to_datetime(config["pred_date"]) - timedelta(days=1))
+            ].tail(self.total_buffer + config["history_len_weeks"])
             self.dataset_raw = self.dataset_raw.reset_index().values.tolist()[
                 self.total_buffer :
             ]
@@ -100,29 +96,27 @@ class HRCDataset(Dataset):
                 self.normalize_feature(
                     feature_row=row,
                     historical_vals=hist_vals,
-                    normal_type=data_config["normal_type"],
-                    eps=data_config["eps"],
+                    normal_type=config["normal_type"],
+                    eps=config["eps"],
                 )
             )
         if self.split == "predict":
             self.dataset = torch.empty(
                 1,
-                data_config["history_len_weeks"],
+                config["history_len_weeks"],
                 self.num_features,
                 dtype=torch.float32,
             )
             self.dataset[0] = torch.stack(
                 [
                     torch.cat([item[0], item[1].view(1)])
-                    for item in self.feats_normalized[
-                        0 : data_config["history_len_weeks"]
-                    ]
+                    for item in self.feats_normalized[0 : config["history_len_weeks"]]
                 ]
             )
             return
 
-        self.history_len_weeks = data_config["history_len_weeks"]
-        self.future_pred_weeks_len = data_config["future_pred_weeks_len"]
+        self.history_len_weeks = config["history_len_weeks"]
+        self.future_pred_weeks_len = config["future_pred_weeks_len"]
         self.total_feature_row = self.history_len_weeks + self.future_pred_weeks_len
         self.num_batchs = int((len(self.dataset_raw) - self.total_feature_row))
 
@@ -136,7 +130,15 @@ class HRCDataset(Dataset):
             self.dataset[i] = torch.stack(
                 [
                     torch.cat([item[0], item[1].view(1)])
-                    for item in self.feats_normalized[i : i + self.total_feature_row]
+                    for item in (
+                        self.feats_normalized[i : i + self.history_len_weeks]
+                        + self.feats_normalized[
+                            i
+                            + self.history_len_weeks : i
+                            + self.history_len_weeks
+                            + self.future_pred_weeks_len
+                        ]
+                    )
                 ]
             )
 
@@ -162,10 +164,10 @@ class HRCDataset(Dataset):
             true_price = 0
             y = 0
         else:
-            feats_transposed_x = raw_item[:-1, :-1].T
-            y = raw_item[-1][:-1]
-            true_price = raw_item[-1][-1]
-            last_price = raw_item[-2][-1]
+            feats_transposed_x = raw_item[: self.history_len_weeks, :-1].T
+            y = raw_item[self.history_len_weeks :, :-1]
+            true_price = raw_item[self.history_len_weeks :, -1]
+            last_price = raw_item[self.history_len_weeks - 1, -1]
         return feats_transposed_x, y, true_price, last_price
 
     def normalize_feature(
@@ -195,31 +197,31 @@ class HRCDataset(Dataset):
 
 class DataModule(L.LightningDataModule):
 
-    def __init__(self, data_config, pred_date=None):
+    def __init__(self, config, pred_date=None):
         super().__init__()
-        self.dataset = HRCDataset(data_config)
-        self.data_config = data_config
+        self.dataset = HRCDataset(config)
+        self.config = config
         self.pred_date = pred_date
 
     def setup(self, stage: str):
         if stage == "fit":
             self.train, self.val = train_test_split(
-                self.dataset, test_size=self.data_config["split_size"], shuffle=True
+                self.dataset, test_size=self.config["split_size"], shuffle=True
             )
         if stage == "test":
-            test_data_config = self.data_config.copy()
-            test_data_config["split"] = "test"
-            self.test_dataset = HRCDataset(test_data_config)
+            test_config = self.config.copy()
+            test_config["split"] = "test"
+            self.test_dataset = HRCDataset(test_config)
         if stage == "predict":
-            predict_data_config = self.data_config.copy()
-            predict_data_config["split"] = "predict"
-            predict_data_config["pred_date"] = self.pred_date
-            self.predict_dataset = HRCDataset(predict_data_config)
+            predict_config = self.config.copy()
+            predict_config["split"] = "predict"
+            predict_config["pred_date"] = self.pred_date
+            self.predict_dataset = HRCDataset(predict_config)
 
     def train_dataloader(self):
         return DataLoader(
             self.train,
-            batch_size=self.data_config["train_batch_size"],
+            batch_size=self.config["train_batch_size"],
             shuffle=True,
             drop_last=True,
         )
@@ -227,7 +229,7 @@ class DataModule(L.LightningDataModule):
     def val_dataloader(self):
         return DataLoader(
             self.val,
-            batch_size=self.data_config["val_batch_size"],
+            batch_size=self.config["val_batch_size"],
             shuffle=True,
             drop_last=True,
         )
@@ -235,7 +237,7 @@ class DataModule(L.LightningDataModule):
     def test_dataloader(self):
         return DataLoader(
             self.test_dataset,
-            batch_size=self.data_config["test_batch_size"],
+            batch_size=self.config["test_batch_size"],
             shuffle=True,
         )
 
@@ -244,20 +246,21 @@ class DataModule(L.LightningDataModule):
 
 
 class Predictor(L.LightningModule):
-    def __init__(self, predictor_config):
+    def __init__(self, config):
         super().__init__()
 
-        self.encoder_d = predictor_config["encoder_d"]
-        self.encoder_nheads = predictor_config["encoder_nheads"]
-        self.transformer_num_layers = predictor_config["transformer_num_layers"]
-        self.transformer_dim_feedfoward = predictor_config["transformer_dim_feedfoward"]
-        self.context_len_week = predictor_config["context_len_week"]
-        self.num_features = predictor_config["num_features"]
-        self.delta_p_wt = predictor_config["delta_p_wt"]
-        self.ps_wt = predictor_config["ps_wt"]
-        self.as_wt = predictor_config["as_wt"]
-        self.threshold = predictor_config["threshold"]
-        self.lr = predictor_config["lr"]
+        self.encoder_d = config["encoder_d"]
+        self.encoder_nheads = config["encoder_nheads"]
+        self.transformer_num_layers = config["transformer_num_layers"]
+        self.transformer_dim_feedfoward = config["transformer_dim_feedfoward"]
+        self.history_len_weeks = config["history_len_weeks"]
+        self.future_pred_weeks_len = config["future_pred_weeks_len"]
+        self.num_features = config["num_features"]
+        self.delta_p_wt = config["delta_p_wt"]
+        self.ps_wt = config["ps_wt"]
+        self.as_wt = config["as_wt"]
+        self.threshold = config["threshold"]
+        self.lr = config["lr"]
 
         self.loss = nn.functional.mse_loss
         self.optimizer = torch.optim.Adam
@@ -272,11 +275,11 @@ class Predictor(L.LightningModule):
             num_layers=self.transformer_num_layers,
             norm=nn.LayerNorm(self.encoder_d),
         )
-        self.rel_week_pos_encoding = nn.Embedding(self.context_len_week, 1)
+        self.rel_week_pos_encoding = nn.Embedding(self.history_len_weeks, 1)
         self.feat_transform_linears = nn.ModuleList(
             [
                 nn.Linear(
-                    self.context_len_week,
+                    self.history_len_weeks,
                     self.encoder_d,
                 )
                 for _ in range(self.num_features)
@@ -285,7 +288,9 @@ class Predictor(L.LightningModule):
         # Predict two outputs per feature (i. del change and ii. change co-efficient to HRC price)
         self.out_layers = nn.ModuleList(
             [
-                nn.Sequential(nn.Linear(self.encoder_d, 2), nn.Tanh())
+                nn.Sequential(
+                    nn.Linear(self.encoder_d, self.future_pred_weeks_len + 1), nn.Tanh()
+                )
                 for _ in range(self.num_features)
             ]
         )
@@ -314,19 +319,19 @@ class Predictor(L.LightningModule):
         Returns:
             _type_: _description_
         """
-        F, B, _ = logits.shape
+        F, B, P = logits.shape
         # x_as: delta change in the feature (a1, a2, a3, ..., a18)
         # shape: (18, 4, 1)
-        x_as = logits[:, :, 0]
+        x_as = logits[:, :, -1]
         # x_ps: change co-efficient to HRC price (del p1, del p2, ..., del p18)
         # shape: (18, 4, 1)
-        x_ps = logits[:, :, 1]
+        x_ps = logits[:, :, :-1]
         # shape: 18 * 4 * 1 -> 4
-        delta_p = (x_as * x_ps).sum(0)
+        delta_p = (x_as.view(F, B, 1) * x_ps).sum(0)
         # true_p = change in hrc price (4 * 1)
-        true_p = y[:, -1]
+        true_p = y[:, :, -1]
         # shape: 18 * 4
-        true_ps = y.T
+        true_ps = y.reshape(F, B, -1)
         # Loss 1: Loss for HRC True Price - HRC Predicted Price
         loss_delta_p = self.loss(delta_p, true_p)
         # Loss 2: Loss for each factor for predicted vs original delta
@@ -338,11 +343,12 @@ class Predictor(L.LightningModule):
         loss = (
             self.delta_p_wt * loss_delta_p + self.ps_wt * loss_ps + self.as_wt * loss_as
         )
-        out = last_price.view(B, 1) + delta_p.view(B, 1) * last_price.view(B, 1)
-        true = true_price.view(B, 1)
+        out = last_price.view(B, 1) + delta_p * last_price.view(B, 1)
 
-        pred_percent = ((out - true) / true) * 100
-        accuracy = torch.sum(pred_percent.abs() <= self.threshold).item() / B
+        pred_percent = ((out - true_price) / true_price) * 100
+        accuracy = torch.sum(pred_percent.abs() <= self.threshold).item() / (
+            B * (P - 1)
+        )
 
         return loss, loss_delta_p, loss_ps, loss_as, accuracy
 
@@ -438,36 +444,36 @@ class Predictor(L.LightningModule):
             batch[2].to(self.device),
             batch[3].to(self.device),
         )
-        print(x.shape)
 
         logits = self.forward(x)
-        F, B, _ = logits.shape
-        x_as = logits[:, :, 0]
-        x_ps = logits[:, :, 1]
-        delta_p = (x_as * x_ps).sum(0)
-        pred_out = last_price.view(B, 1) + delta_p.view(B, 1) * last_price.view(B, 1)
-        return pred_out
+        F, B, P = logits.shape
+        x_as = logits[:, :, -1]
+        x_ps = logits[:, :, :-1]
+        delta_p = (x_as.view(F, B, 1) * x_ps).sum(0)
+        pred_out = last_price.view(B, 1) + delta_p * last_price.view(B, 1)
+        return pred_out, x_as, x_ps
 
     def configure_optimizers(self):
         optimizer = self.optimizer(self.parameters(), lr=self.lr)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer,
-                    mode="min",
-                    verbose=True,
-                    patience=5,
-                    factor=0.05,
-                ),
-                "monitor": "val/loss_total",
-            },
-        }
+        # return {
+        #     "optimizer": optimizer,
+        #     "lr_scheduler": {
+        #         "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(
+        #             optimizer,
+        #             mode="min",
+        #             verbose=True,
+        #             patience=5,
+        #             factor=0.05,
+        #             threshold=1e-8,
+        #         ),
+        #         "monitor": "val/loss_total",
+        #     },
+        # }
         return optimizer
 
 
 if __name__ == "__main__":
-    datamodule = DataModule(data_config=data_config)
+    datamodule = DataModule(config=config)
     wandb_logger = WandbLogger(log_model="all")
     trainer = Trainer(
         accelerator=device,
@@ -481,6 +487,6 @@ if __name__ == "__main__":
             )
         ],
     )
-    predictor = Predictor(predictor_config=predictor_config)
+    predictor = Predictor(config=config)
     trainer.fit(model=predictor, datamodule=datamodule)
     trainer.test(ckpt_path="best", datamodule=datamodule)
