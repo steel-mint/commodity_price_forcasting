@@ -24,6 +24,7 @@ config = {
     "future_pred_weeks_len": 1,
     "total_buffer": 10,
     "normal_type": "mean",
+    "gap": 1,
     "eps": 1e-8,
     "train_batch_size": 4,
     "val_batch_size": 4,
@@ -48,6 +49,7 @@ class HRCDataset(Dataset):
 
         self.total_buffer = config["total_buffer"]
         self.split = config["split"]
+        self.gap = config["gap"]
         if self.split == "predict":
             self.dataset_raw_df = pd.concat(
                 [
@@ -63,7 +65,10 @@ class HRCDataset(Dataset):
 
             self.dataset_raw = self.dataset_raw_df[
                 self.dataset_raw_df.index
-                < (pd.to_datetime(config["pred_date"]) - timedelta(days=1))
+                < (
+                    pd.to_datetime(config["pred_date"])
+                    - timedelta(days=1 + 7 * self.gap)
+                )
             ].tail(self.total_buffer + config["history_len_weeks"])
             self.dataset_raw = self.dataset_raw.reset_index().values.tolist()[
                 self.total_buffer :
@@ -118,7 +123,9 @@ class HRCDataset(Dataset):
         self.history_len_weeks = config["history_len_weeks"]
         self.future_pred_weeks_len = config["future_pred_weeks_len"]
         self.total_feature_row = self.history_len_weeks + self.future_pred_weeks_len
-        self.num_batchs = int((len(self.dataset_raw) - self.total_feature_row))
+        self.num_batchs = int(
+            (len(self.dataset_raw) - self.total_feature_row - self.gap)
+        )
 
         self.dataset = torch.empty(
             self.num_batchs,
@@ -134,8 +141,10 @@ class HRCDataset(Dataset):
                         self.feats_normalized[i : i + self.history_len_weeks]
                         + self.feats_normalized[
                             i
-                            + self.history_len_weeks : i
                             + self.history_len_weeks
+                            + self.gap : i
+                            + self.history_len_weeks
+                            + self.gap
                             + self.future_pred_weeks_len
                         ]
                     )
@@ -343,6 +352,7 @@ class Predictor(L.LightningModule):
         loss = (
             self.delta_p_wt * loss_delta_p + self.ps_wt * loss_ps + self.as_wt * loss_as
         )
+
         out = last_price.view(B, 1) + delta_p * last_price.view(B, 1)
 
         pred_percent = ((out - true_price) / true_price) * 100
@@ -351,6 +361,7 @@ class Predictor(L.LightningModule):
         )
 
         return loss, loss_delta_p, loss_ps, loss_as, accuracy
+        # return loss, accuracy
 
     def training_step(self, batch, batch_idx):
         x, y, true_price, last_price = (
